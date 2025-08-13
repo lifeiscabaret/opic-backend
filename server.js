@@ -1,3 +1,4 @@
+// server.js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -6,38 +7,57 @@ import { OpenAI } from 'openai';
 
 const app = express();
 const port = process.env.PORT || 8080;
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Netlify 최종 도메인으로 교체(배포 후 실제 도메인 넣기)
-const allowedOrigins = [
-    'http://localhost:5173',
-    'https://<your-netlify>.netlify.app',
-    'https://<your-custom-domain>' // 있으면
+/** ✅ CORS
+ * - Render 환경변수 ALLOWED_ORIGINS 에 콤마(,)로 여러 도메인 지정 가능.
+ * - 미지정 시 기본값으로 Netlify 프로덕션 도메인과 localhost:3000 허용.
+ */
+const DEFAULT_ORIGINS = [
+    'https://illustrious-hummingbird-0af3bb.netlify.app', // ← 네 도메인
+    'http://localhost:3000',
 ];
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS && process.env.ALLOWED_ORIGINS.trim().length > 0)
+    ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
+    : DEFAULT_ORIGINS;
+
 app.use(cors({
-    origin: (origin, cb) => {
-        if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-        return cb(new Error('CORS blocked'), false);
-    }
+    origin(origin, cb) {
+        // 서버 내부/헬스체크 등 Origin 없는 요청 허용
+        if (!origin) return cb(null, true);
+        const ok = allowedOrigins.includes(origin);
+        return ok ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`), false);
+    },
+    credentials: false, // 쿠키 안 쓰면 false
 }));
+
 app.use(express.json({ limit: '10mb' }));
 
-// 헬스체크
-app.get('/health', (_, res) => res.json({ ok: true }));
+// 업로드(메모리 저장)
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 25 * 1024 * 1024 },
+});
 
-// GPT 답변 라우트 (텍스트 질문)
-app.post('/api/ask', async (req, res) => {
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// 헬스체크
+app.get('/health', (_req, res) => res.json({ ok: true, origins: allowedOrigins }));
+
+// 프론트가 부르는 엔드포인트 (POST /ask { question, prompt? })
+app.post('/ask', async (req, res) => {
     try {
-        const { prompt } = req.body;
-        if (!prompt) return res.status(400).json({ error: 'prompt required' });
+        const { question, prompt } = req.body || {};
+        const content = prompt ?? question;
+        if (!content) return res.status(400).json({ error: 'question required' });
 
         const completion = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
             messages: [
                 { role: 'system', content: 'You are a helpful OPIC practice coach.' },
-                { role: 'user', content: prompt }
+                { role: 'user', content },
             ],
-            temperature: 0.7
+            temperature: 0.7,
         });
 
         const answer = completion.choices?.[0]?.message?.content ?? '';
@@ -48,23 +68,7 @@ app.post('/api/ask', async (req, res) => {
     }
 });
 
-// STT(선택) — 브라우저에서 FormData(audio) 업로드
-const upload = multer({ limits: { fileSize: 25 * 1024 * 1024 } });
-app.post('/api/stt', upload.single('audio'), async (req, res) => {
-    try {
-        if (!req.file) return res.status(400).json({ error: 'audio required' });
-
-        // Whisper 사용 예 (모델/엔드포인트는 네임 확인 필요)
-        const transcript = await openai.audio.transcriptions.create({
-            file: new File([req.file.buffer], 'audio.webm', { type: req.file.mimetype }),
-            model: 'gpt-4o-transcribe' // 또는 'whisper-1' 등, 계정에서 사용 가능한 모델로
-        });
-
-        res.json({ text: transcript.text });
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: 'stt_error' });
-    }
-});
+// (선택) STT 라우트는 나중에 추가
+// app.post('/stt', upload.single('audio'), ...)
 
 app.listen(port, () => console.log(`Server on :${port}`));
