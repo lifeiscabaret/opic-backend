@@ -10,34 +10,30 @@ const app = express();
 const port = process.env.PORT || 8080;
 
 /* ---------------------------------- CORS ---------------------------------- */
-// 허용 도메인: 환경변수 ALLOWED_ORIGINS가 있으면 우선, 없으면 기본값 사용
 const DEFAULT_ORIGINS = [
     'https://illustrious-hummingbird-0af3bb.netlify.app',
     'http://localhost:3000',
 ];
 
-const allowedOrigins = (process.env.ALLOWED_ORIGINS && process.env.ALLOWED_ORIGINS.trim().length > 0)
-    ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
-    : DEFAULT_ORIGINS;
+const allowedOrigins =
+    (process.env.ALLOWED_ORIGINS && process.env.ALLOWED_ORIGINS.trim().length > 0)
+        ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
+        : DEFAULT_ORIGINS;
 
 app.use(cors({
     origin(origin, cb) {
-        // 서버 내부 호출/헬스체크 등 Origin 없는 요청 허용
-        if (!origin) return cb(null, true);
+        if (!origin) return cb(null, true); // 서버 내부/헬스체크 등
         const ok = allowedOrigins.includes(origin);
         return ok ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`), false);
     },
     credentials: false,
 }));
-
-// 모든 경로의 프리플라이트 허용
 app.options('*', cors());
 
 /* ---------------------------- Body & Upload Limit --------------------------- */
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: false }));
 
-// 업로드(메모리 저장) — 필요 시 STT 등에서 사용
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 25 * 1024 * 1024 },
@@ -49,17 +45,17 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 /* --------------------------------- Utils ---------------------------------- */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-/* --------------------------------- Health --------------------------------- */
-// 루트: HTML 404 방지용 JSON 안내
-app.get('/', (_req, res) => res.json({ service: 'OPIC Backend', ok: true }));
+// ✅ D‑ID 인증 헤더 (Basic: base64("<API_KEY>:"))
+const didAuth =
+    'Basic ' + Buffer.from(String(process.env.DID_API_KEY || '') + ':').toString('base64');
 
-// 헬스엔드포인트 (/health, /api/health 모두 지원)
+/* --------------------------------- Health --------------------------------- */
+app.get('/', (_req, res) => res.json({ service: 'OPIC Backend', ok: true }));
 app.get(['/health', '/api/health'], (_req, res) =>
     res.json({ ok: true, origins: allowedOrigins, routes: ['/ask', '/api/ask', '/speak', '/api/speak'] })
 );
 
 /* ----------------------------------- ASK ---------------------------------- */
-// 프론트가 부르는 엔드포인트 (POST /ask 또는 /api/ask)
 app.post(['/ask', '/api/ask'], async (req, res) => {
     try {
         const { question, prompt } = req.body || {};
@@ -95,11 +91,11 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
             return res.status(500).json({ error: 'did_api_key_missing' });
         }
 
-        // 1) 생성 요청
+        // 1) 생성 요청 (🔁 Bearer → ✅ Basic)
         const createdRes = await fetch('https://api.d-id.com/talks', {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${process.env.DID_API_KEY}`,
+                Authorization: didAuth, // ✅
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
@@ -113,38 +109,34 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
             }),
         });
 
-        // D‑ID가 HTML을 줄 때를 대비해 항상 text 먼저 읽기
         const createdText = await createdRes.text();
         if (!createdRes.ok) {
-            return res
-                .status(createdRes.status)
+            return res.status(createdRes.status)
                 .json({ error: 'did_create_failed', body: createdText.slice(0, 500) });
         }
         let created;
-        try { created = JSON.parse(createdText); } catch {
-            return res.status(502).json({ error: 'did_create_not_json', body: createdText.slice(0, 500) });
-        }
+        try { created = JSON.parse(createdText); }
+        catch { return res.status(502).json({ error: 'did_create_not_json', body: createdText.slice(0, 500) }); }
         if (!created?.id) {
             return res.status(502).json({ error: 'create_failed', detail: created });
         }
 
-        // 2) 상태 폴링 (최대 ~30초)
+        // 2) 상태 폴링 (🔁 Bearer → ✅ Basic)
         let videoUrl = null;
         for (let i = 0; i < 24; i++) {
             await sleep(1250);
             const pollRes = await fetch(`https://api.d-id.com/talks/${created.id}`, {
-                headers: { Authorization: `Bearer ${process.env.DID_API_KEY}` },
+                headers: { Authorization: didAuth }, // ✅
             });
             const pollText = await pollRes.text();
             if (!pollRes.ok) {
-                return res
-                    .status(pollRes.status)
+                return res.status(pollRes.status)
                     .json({ error: 'did_poll_failed', body: pollText.slice(0, 500) });
             }
             let data;
-            try { data = JSON.parse(pollText); } catch {
-                return res.status(502).json({ error: 'did_poll_not_json', body: pollText.slice(0, 500) });
-            }
+            try { data = JSON.parse(pollText); }
+            catch { return res.status(502).json({ error: 'did_poll_not_json', body: pollText.slice(0, 500) }); }
+
             if (data?.result_url) { videoUrl = data.result_url; break; }
             if (data?.status === 'error') {
                 return res.status(502).json({ error: 'render_error', detail: data });
@@ -160,16 +152,10 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
 });
 
 /* ------------------------------ (옵션) STT 등 ------------------------------ */
-// 예시: 브라우저 업로드 파일 받아 Whisper로 처리할 때
 // app.post(['/stt','/api/stt'], upload.single('audio'), async (req, res) => { ... });
 
 /* -------------------------- 404/에러 핸들러(JSON) -------------------------- */
-// 존재하지 않는 경로는 HTML 대신 JSON 404
-app.use((req, res) => {
-    res.status(404).json({ error: 'not_found', path: req.path });
-});
-
-// 최종 에러 핸들러
+app.use((req, res) => res.status(404).json({ error: 'not_found', path: req.path }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {
     console.error('[UNCAUGHT ERROR]', err);
