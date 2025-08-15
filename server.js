@@ -23,7 +23,7 @@ const allowedOrigins =
 
 app.use(cors({
     origin(origin, cb) {
-        if (!origin) return cb(null, true);
+        if (!origin) return cb(null, true); // health 등
         const ok = allowedOrigins.includes(origin);
         return ok ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`), false);
     },
@@ -51,7 +51,7 @@ const didAuth =
     'Basic ' + Buffer.from(String(process.env.DID_API_KEY || '') + ':').toString('base64');
 
 /* ----------------------------- In‑Memory Media ----------------------------- */
-// 간단한 메모리 캐시(DB 대체). 프로세스 리스타트 시 사라짐.
+// 프로세스 리스타트 시 사라지는 간단 캐시
 const mediaStore = new Map(); // id -> { buf, mime, ts }
 const MEDIA_TTL_MS = Number(process.env.MEDIA_TTL_MS || 1000 * 60 * 60); // 1h
 
@@ -69,7 +69,7 @@ function getMedia(id) {
     }
     return item;
 }
-// 주기적으로 청소
+// 주기 청소
 setInterval(() => {
     const now = Date.now();
     for (const [id, v] of mediaStore) {
@@ -112,19 +112,13 @@ app.post(['/ask', '/api/ask'], async (req, res) => {
 });
 
 /* ---------------------------------- SPEAK --------------------------------- */
-// 텍스트+이미지 → D‑ID 립싱크 영상 생성 후 URL 반환
+// 텍스트+이미지 → D‑ID 립싱크 영상 URL
 app.post(['/speak', '/api/speak'], async (req, res) => {
     try {
         const { text, imageUrl, voice = 'en-US-JennyNeural' } = req.body || {};
-        if (!text || !imageUrl) {
-            return res.status(400).json({ error: 'text and imageUrl required' });
-        }
-        if (text.trim().length < 3) {
-            return res.status(400).json({ error: 'text_too_short', min: 3 });
-        }
-        if (!process.env.DID_API_KEY) {
-            return res.status(500).json({ error: 'did_api_key_missing' });
-        }
+        if (!text || !imageUrl) return res.status(400).json({ error: 'text and imageUrl required' });
+        if (text.trim().length < 3) return res.status(400).json({ error: 'text_too_short', min: 3 });
+        if (!process.env.DID_API_KEY) return res.status(500).json({ error: 'did_api_key_missing' });
 
         // 1) 생성 요청
         const createdRes = await fetch('https://api.d-id.com/talks', {
@@ -164,9 +158,7 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
                 body: createdText.slice(0, 800),
             });
         }
-        if (!created?.id) {
-            return res.status(502).json({ error: 'create_failed', detail: created });
-        }
+        if (!created?.id) return res.status(502).json({ error: 'create_failed', detail: created });
 
         // 2) 상태 폴링
         let videoUrl = null;
@@ -227,7 +219,6 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
             format, // 'mp3'
         });
 
-        // SDK returns a WebResponse-like object; get ArrayBuffer then to Buffer
         const arrayBuf = await speech.arrayBuffer();
         const buf = Buffer.from(arrayBuf);
         const id = putMedia(buf, 'audio/mpeg');
@@ -241,12 +232,53 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
 });
 
 /* ----------------------------- Serve TTS media ----------------------------- */
+// iOS 호환을 위해 Range/HEAD 지원
+app.head('/media/tts/:id', (req, res) => {
+    const item = getMedia(req.params.id);
+    if (!item) return res.status(404).end();
+    res.setHeader('Content-Type', item.mime || 'audio/mpeg');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.setHeader('Content-Length', String(item.buf.length));
+    return res.status(200).end();
+});
+
 app.get('/media/tts/:id', (req, res) => {
     const item = getMedia(req.params.id);
     if (!item) return res.status(404).send('Not found');
-    res.setHeader('Content-Type', item.mime || 'audio/mpeg');
+
+    const buf = item.buf;
+    const total = buf.length;
+    const range = req.headers.range;
+
     res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-    res.send(item.buf);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Type', item.mime || 'audio/mpeg');
+
+    if (!range) {
+        res.setHeader('Content-Length', String(total));
+        return res.status(200).end(buf);
+    }
+
+    // Parse Range: e.g. "bytes=0-"
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!m) {
+        res.setHeader('Content-Length', String(total));
+        return res.status(200).end(buf);
+    }
+
+    let start = m[1] ? parseInt(m[1], 10) : 0;
+    let end = m[2] ? parseInt(m[2], 10) : total - 1;
+    if (isNaN(start) || isNaN(end) || start > end || start >= total) {
+        return res.status(416).set('Content-Range', `bytes */${total}`).end();
+    }
+    end = Math.min(end, total - 1);
+
+    const chunk = buf.subarray(start, end + 1);
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+    res.setHeader('Content-Length', String(chunk.length));
+    return res.end(chunk);
 });
 
 /* ------------------------------ (옵션) STT 등 ------------------------------ */
