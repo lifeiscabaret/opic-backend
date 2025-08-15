@@ -5,6 +5,7 @@ import cors from 'cors';
 import multer from 'multer';
 import { OpenAI } from 'openai';
 import fetch from 'node-fetch';
+import crypto from 'crypto';
 
 const app = express();
 const port = process.env.PORT || 8080;
@@ -22,7 +23,7 @@ const allowedOrigins =
 
 app.use(cors({
     origin(origin, cb) {
-        if (!origin) return cb(null, true); // 서버 내부/헬스체크 등
+        if (!origin) return cb(null, true);
         const ok = allowedOrigins.includes(origin);
         return ok ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`), false);
     },
@@ -49,10 +50,41 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const didAuth =
     'Basic ' + Buffer.from(String(process.env.DID_API_KEY || '') + ':').toString('base64');
 
+/* ----------------------------- In‑Memory Media ----------------------------- */
+// 간단한 메모리 캐시(DB 대체). 프로세스 리스타트 시 사라짐.
+const mediaStore = new Map(); // id -> { buf, mime, ts }
+const MEDIA_TTL_MS = Number(process.env.MEDIA_TTL_MS || 1000 * 60 * 60); // 1h
+
+function putMedia(buf, mime = 'audio/mpeg') {
+    const id = crypto.randomUUID();
+    mediaStore.set(id, { buf, mime, ts: Date.now() });
+    return id;
+}
+function getMedia(id) {
+    const item = mediaStore.get(id);
+    if (!item) return null;
+    if (Date.now() - item.ts > MEDIA_TTL_MS) {
+        mediaStore.delete(id);
+        return null;
+    }
+    return item;
+}
+// 주기적으로 청소
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, v] of mediaStore) {
+        if (now - v.ts > MEDIA_TTL_MS) mediaStore.delete(id);
+    }
+}, 60_000);
+
 /* --------------------------------- Health --------------------------------- */
 app.get('/', (_req, res) => res.json({ service: 'OPIC Backend', ok: true }));
 app.get(['/health', '/api/health'], (_req, res) =>
-    res.json({ ok: true, origins: allowedOrigins, routes: ['/ask', '/api/ask', '/speak', '/api/speak'] })
+    res.json({
+        ok: true,
+        origins: allowedOrigins,
+        routes: ['/ask', '/api/ask', '/speak', '/api/speak', '/tts', '/media/tts/:id'],
+    })
 );
 
 /* ----------------------------------- ASK ---------------------------------- */
@@ -90,7 +122,6 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
         if (text.trim().length < 3) {
             return res.status(400).json({ error: 'text_too_short', min: 3 });
         }
-
         if (!process.env.DID_API_KEY) {
             return res.status(500).json({ error: 'did_api_key_missing' });
         }
@@ -104,11 +135,11 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
                 Accept: 'application/json',
             },
             body: JSON.stringify({
-                source_url: imageUrl, // 공개 이미지 URL
+                source_url: imageUrl,
                 script: {
                     type: 'text',
                     input: text,
-                    provider: { type: 'microsoft', voice_id: voice }, // 예: en-US-JennyNeural
+                    provider: { type: 'microsoft', voice_id: voice },
                 },
                 config: { stitch: true, result_format: 'mp4' },
             }),
@@ -137,7 +168,7 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
             return res.status(502).json({ error: 'create_failed', detail: created });
         }
 
-        // 2) 상태 폴링 (최대 ~30초)
+        // 2) 상태 폴링
         let videoUrl = null;
         for (let i = 0; i < 24; i++) {
             await sleep(1250);
@@ -175,6 +206,47 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
         console.error('[SPEAK ERROR]', e);
         return res.status(500).json({ error: 'server_error' });
     }
+});
+
+/* ----------------------------------- TTS ---------------------------------- */
+// 텍스트 → 고음질 MP3 생성 후 미디어 URL 반환
+app.post(['/tts', '/api/tts'], async (req, res) => {
+    try {
+        const { text, voice } = req.body || {};
+        const input = (text || '').toString().trim();
+        if (!input) return res.status(400).json({ error: 'text required' });
+
+        const model = process.env.TTS_MODEL || 'tts-1';
+        const voiceId = voice || process.env.TTS_VOICE || 'alloy';
+        const format = 'mp3';
+
+        const speech = await openai.audio.speech.create({
+            model,
+            voice: voiceId,
+            input,
+            format, // 'mp3'
+        });
+
+        // SDK returns a WebResponse-like object; get ArrayBuffer then to Buffer
+        const arrayBuf = await speech.arrayBuffer();
+        const buf = Buffer.from(arrayBuf);
+        const id = putMedia(buf, 'audio/mpeg');
+
+        const audioUrl = `${req.protocol}://${req.get('host')}/media/tts/${id}`;
+        return res.json({ audioUrl, model, voice: voiceId });
+    } catch (e) {
+        console.error('[TTS ERROR]', e);
+        return res.status(500).json({ error: 'server_error' });
+    }
+});
+
+/* ----------------------------- Serve TTS media ----------------------------- */
+app.get('/media/tts/:id', (req, res) => {
+    const item = getMedia(req.params.id);
+    if (!item) return res.status(404).send('Not found');
+    res.setHeader('Content-Type', item.mime || 'audio/mpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+    res.send(item.buf);
 });
 
 /* ------------------------------ (옵션) STT 등 ------------------------------ */
