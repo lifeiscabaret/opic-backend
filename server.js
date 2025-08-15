@@ -87,56 +87,82 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
         if (!text || !imageUrl) {
             return res.status(400).json({ error: 'text and imageUrl required' });
         }
+        if (text.trim().length < 3) {
+            return res.status(400).json({ error: 'text_too_short', min: 3 });
+        }
+
         if (!process.env.DID_API_KEY) {
             return res.status(500).json({ error: 'did_api_key_missing' });
         }
 
-        // 1) 생성 요청 (🔁 Bearer → ✅ Basic)
+        // 1) 생성 요청
         const createdRes = await fetch('https://api.d-id.com/talks', {
             method: 'POST',
             headers: {
-                Authorization: didAuth, // ✅
+                Authorization: didAuth,
                 'Content-Type': 'application/json',
+                Accept: 'application/json',
             },
             body: JSON.stringify({
-                source_url: imageUrl,
+                source_url: imageUrl, // 공개 이미지 URL
                 script: {
                     type: 'text',
                     input: text,
-                    provider: { type: 'microsoft', voice_id: voice },
+                    provider: { type: 'microsoft', voice_id: voice }, // 예: en-US-JennyNeural
                 },
                 config: { stitch: true, result_format: 'mp4' },
             }),
         });
 
         const createdText = await createdRes.text();
+        const createdCT = createdRes.headers.get('content-type') || '';
         if (!createdRes.ok) {
-            return res.status(createdRes.status)
-                .json({ error: 'did_create_failed', body: createdText.slice(0, 500) });
+            return res.status(createdRes.status).json({
+                error: 'did_create_failed',
+                status: createdRes.status,
+                contentType: createdCT,
+                body: createdText.slice(0, 800),
+            });
         }
         let created;
         try { created = JSON.parse(createdText); }
-        catch { return res.status(502).json({ error: 'did_create_not_json', body: createdText.slice(0, 500) }); }
+        catch {
+            return res.status(502).json({
+                error: 'did_create_not_json',
+                contentType: createdCT,
+                body: createdText.slice(0, 800),
+            });
+        }
         if (!created?.id) {
             return res.status(502).json({ error: 'create_failed', detail: created });
         }
 
-        // 2) 상태 폴링 (🔁 Bearer → ✅ Basic)
+        // 2) 상태 폴링 (최대 ~30초)
         let videoUrl = null;
         for (let i = 0; i < 24; i++) {
             await sleep(1250);
             const pollRes = await fetch(`https://api.d-id.com/talks/${created.id}`, {
-                headers: { Authorization: didAuth }, // ✅
+                headers: { Authorization: didAuth, Accept: 'application/json' },
             });
             const pollText = await pollRes.text();
+            const pollCT = pollRes.headers.get('content-type') || '';
             if (!pollRes.ok) {
-                return res.status(pollRes.status)
-                    .json({ error: 'did_poll_failed', body: pollText.slice(0, 500) });
+                return res.status(pollRes.status).json({
+                    error: 'did_poll_failed',
+                    status: pollRes.status,
+                    contentType: pollCT,
+                    body: pollText.slice(0, 800),
+                });
             }
             let data;
             try { data = JSON.parse(pollText); }
-            catch { return res.status(502).json({ error: 'did_poll_not_json', body: pollText.slice(0, 500) }); }
-
+            catch {
+                return res.status(502).json({
+                    error: 'did_poll_not_json',
+                    contentType: pollCT,
+                    body: pollText.slice(0, 800),
+                });
+            }
             if (data?.result_url) { videoUrl = data.result_url; break; }
             if (data?.status === 'error') {
                 return res.status(502).json({ error: 'render_error', detail: data });
