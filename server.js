@@ -83,7 +83,14 @@ app.get(['/health', '/api/health'], (_req, res) =>
     res.json({
         ok: true,
         origins: allowedOrigins,
-        routes: ['/ask', '/api/ask', '/speak', '/api/speak', '/tts', '/tts-eleven', '/media/tts/:id'],
+        routes: [
+            '/ask', '/api/ask',
+            '/speak', '/api/speak',
+            '/tts', '/api/tts',
+            '/tts-eleven', '/api/tts-eleven',
+            '/stt', '/api/stt',                 // ✅ 추가됨
+            '/media/tts/:id'
+        ],
     })
 );
 
@@ -200,8 +207,14 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
     }
 });
 
-/* ----------------------------------- OpenAI TTS ---------------------------- */
-// 텍스트 → 고음질 MP3 생성 후 미디어 URL 반환 (백업 라인)
+/* ------------------------ OpenAI TTS (백업 라인) --------------------------- */
+// ✅ 보이스 안전화: MS/Azure 스타일이 오면 alloy로 강제 매핑
+const normalizeOpenAIVoice = (v) => {
+    if (!v) return null;
+    if (/jenny|neural|en-?us/i.test(v)) return 'alloy'; // 방어 매핑
+    return v;
+};
+
 app.post(['/tts', '/api/tts'], async (req, res) => {
     try {
         const { text, voice } = req.body || {};
@@ -209,7 +222,7 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
         if (!input) return res.status(400).json({ error: 'text required' });
 
         const model = process.env.TTS_MODEL || 'tts-1';
-        const voiceId = voice || process.env.TTS_VOICE || 'alloy';
+        const voiceId = normalizeOpenAIVoice(voice) || process.env.TTS_VOICE || 'alloy';
         const format = 'mp3';
 
         const speech = await openai.audio.speech.create({
@@ -231,7 +244,7 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
     }
 });
 
-/* --------------------------------- ElevenLabs TTS -------------------------- */
+/* --------------------------- ElevenLabs TTS (우선) ------------------------- */
 // 모바일(iOS) 안정화를 위한 우선 경로
 app.post(['/tts-eleven', '/api/tts-eleven'], async (req, res) => {
     try {
@@ -262,6 +275,49 @@ app.post(['/tts-eleven', '/api/tts-eleven'], async (req, res) => {
     } catch (e) {
         console.error('[ELEVEN TTS ERROR]', e);
         return res.status(500).json({ error: 'server_error' });
+    }
+});
+
+/* ------------------------------- STT 프록시 추가 --------------------------- */
+/** 
+ * 프론트에서 FormData('file'=<Blob>)로 업로드 → 백엔드가 OpenAI Whisper에 전달
+ * - 프론트 키 노출 없음
+ * - 업로드 필드명: "file" (App.js와 일치)
+ */
+app.post(['/stt', '/api/stt'], upload.single('file'), async (req, res) => {
+    try {
+        if (!process.env.OPENAI_API_KEY) {
+            return res.status(500).json({ error: 'openai_api_key_missing' });
+        }
+        if (!req.file) {
+            return res.status(400).json({ error: 'no_file' });
+        }
+        const filename = req.file.originalname || 'recording.webm';
+        const mimetype = req.file.mimetype || 'audio/webm';
+
+        // Node18+ (undici) 전역 FormData / File / Blob 사용
+        const form = new FormData();
+        form.append('model', 'whisper-1');
+        form.append('file', new File([req.file.buffer], filename, { type: mimetype }));
+        // 옵션 예시:
+        // form.append('temperature', '0');
+        // form.append('language', 'en');
+
+        const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+            body: form,
+        });
+
+        if (!r.ok) {
+            const errTxt = await r.text().catch(() => '');
+            return res.status(r.status).send(errTxt);
+        }
+        const j = await r.json();
+        return res.json({ text: j.text || '' });
+    } catch (e) {
+        console.error('[STT ERROR]', e);
+        return res.status(500).json({ error: 'stt_failed' });
     }
 });
 
@@ -314,10 +370,7 @@ app.get('/media/tts/:id', (req, res) => {
     return res.end(chunk);
 });
 
-/* ------------------------------ (옵션) STT 등 ------------------------------ */
-// app.post(['/stt','/api/stt'], upload.single('audio'), async (req, res) => { ... });
-
-/* -------------------------- 404/에러 핸들러(JSON) -------------------------- */
+/* ------------------------------ 404/에러 핸들러 ---------------------------- */
 app.use((req, res) => res.status(404).json({ error: 'not_found', path: req.path }));
 // eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {
