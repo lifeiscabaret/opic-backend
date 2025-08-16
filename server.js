@@ -1,187 +1,111 @@
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
-import multer from 'multer';
-import { OpenAI } from 'openai';
-import fetch from 'node-fetch';
-import crypto from 'crypto';
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import fetch from "node-fetch";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import OpenAI from "openai";
 
+/* ---------------- 경로 유틸 ---------------- */
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/* ---------------- 기본 설정 ---------------- */
 const app = express();
-const port = process.env.PORT || 8080;
-
-/* ---------------------------------- CORS ---------------------------------- */
-const DEFAULT_ORIGINS = [
-    'https://illustrious-hummingbird-0af3bb.netlify.app',
-    'http://localhost:3000',
-];
-const allowedOrigins =
-    (process.env.ALLOWED_ORIGINS && process.env.ALLOWED_ORIGINS.trim().length > 0)
-        ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
-        : DEFAULT_ORIGINS;
-
-app.use(cors({
-    origin(origin, cb) {
-        if (!origin) return cb(null, true);
-        const ok = allowedOrigins.includes(origin);
-        return ok ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`), false);
-    },
-}));
-app.options('*', cors());
-
-/* ---------------------------- Body & Upload Limit --------------------------- */
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: false }));
-
-const upload = multer({
-    storage: multer.memoryStorage(),
-    limits: { fileSize: 25 * 1024 * 1024 },
-});
-
-/* --------------------------------- Clients -------------------------------- */
+const PORT = process.env.PORT || 5000;
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-/* ----------------------------- In-Memory Media ----------------------------- */
-const mediaStore = new Map();
-const MEDIA_TTL_MS = 1000 * 60 * 60; // 1시간
-function putMedia(buf, mime = 'audio/mpeg') {
-    const id = crypto.randomUUID();
-    mediaStore.set(id, { buf, mime, ts: Date.now() });
-    return id;
-}
-function getMedia(id) {
-    const item = mediaStore.get(id);
-    if (!item) return null;
-    if (Date.now() - item.ts > MEDIA_TTL_MS) {
-        mediaStore.delete(id);
-        return null;
-    }
-    return item;
-}
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, v] of mediaStore) {
-        if (now - v.ts > MEDIA_TTL_MS) mediaStore.delete(id);
-    }
-}, 60_000);
-
-/* --------------------------------- Health --------------------------------- */
-app.get(['/health'], (_req, res) =>
-    res.json({
-        ok: true,
-        origins: allowedOrigins,
-        routes: ['/ask', '/tts-eleven', '/stt', '/media/tts/:id'],
+/* ---------------- CORS ---------------- */
+const allowedOrigins = [
+    "https://illustrious-hummingbird-0af3bb.netlify.app",
+    "http://localhost:3000",
+];
+app.use(
+    cors({
+        origin: allowedOrigins,
+        methods: ["GET", "POST", "OPTIONS"],
+        allowedHeaders: ["Content-Type"],
     })
 );
 
-/* ----------------------------------- ASK ---------------------------------- */
-app.post(['/ask'], async (req, res) => {
-    try {
-        const { question, prompt } = req.body || {};
-        const content = (prompt ?? question)?.toString().trim();
-        if (!content) return res.status(400).json({ error: 'question required' });
+/* ---------------- 바디 파서 ---------------- */
+app.use(express.json({ limit: "10mb" }));
 
+/* ---------------- 업로드 ---------------- */
+const upload = multer({ dest: "uploads/" });
+
+/* ---------------- 라우트 ---------------- */
+
+// health check
+app.get("/health", (req, res) => {
+    res.json({
+        ok: true,
+        origins: allowedOrigins,
+        routes: ["/ask", "/tts-eleven", "/stt", "/media/tts/:id"],
+    });
+});
+
+// GPT 질문/답변
+app.post("/ask", async (req, res) => {
+    try {
+        const { question } = req.body;
         const completion = await openai.chat.completions.create({
-            model: 'gpt-4o-mini',
-            messages: [
-                { role: 'system', content: 'You are a helpful OPIC practice coach.' },
-                { role: 'user', content },
-            ],
-            temperature: 0.7,
+            model: "gpt-4o-mini",
+            messages: [{ role: "user", content: question }],
         });
-        const answer = completion.choices?.[0]?.message?.content ?? '';
-        return res.json({ answer });
-    } catch (e) {
-        console.error('[ASK ERROR]', e);
-        return res.status(500).json({ error: 'server_error' });
+        const answer = completion.choices[0].message.content;
+        res.json({ answer });
+    } catch (err) {
+        console.error("ask error:", err);
+        res.status(500).json({ error: "ask_failed" });
     }
 });
 
-/* --------------------------- ElevenLabs TTS + 폴백 ------------------------- */
-app.post(['/tts-eleven'], async (req, res) => {
+// OpenAI TTS
+app.post("/tts-eleven", async (req, res) => {
     try {
-        const { text, voice = 'Rachel' } = req.body || {};
-        const input = (text || '').toString().trim();
-        if (!input) return res.status(400).json({ error: 'text required' });
+        const { text } = req.body;
+        if (!text) return res.status(400).json({ error: "no_text" });
 
-        // 1) ElevenLabs 시도
-        if (process.env.ELEVEN_API_KEY) {
-            try {
-                const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice)}`, {
-                    method: 'POST',
-                    headers: {
-                        'xi-api-key': process.env.ELEVEN_API_KEY,
-                        'Content-Type': 'application/json',
-                        'Accept': 'audio/mpeg',
-                    },
-                    body: JSON.stringify({ text: input }),
-                });
-                if (r.ok) {
-                    const buf = Buffer.from(await r.arrayBuffer());
-                    const id = putMedia(buf, 'audio/mpeg');
-                    const audioUrl = `${req.protocol}://${req.get('host')}/media/tts/${id}`;
-                    return res.json({ audioUrl, provider: 'elevenlabs', voice });
-                } else {
-                    console.warn('[ElevenLabs 실패, OpenAI 폴백 사용]');
-                }
-            } catch (err) {
-                console.warn('[ElevenLabs 호출 오류, OpenAI 폴백]', err);
-            }
-        }
-
-        // 2) OpenAI TTS 폴백
-        const speech = await openai.audio.speech.create({
-            model: 'tts-1',
-            voice: 'alloy',
-            input,
-            format: 'mp3',
+        const speechFile = path.join(__dirname, "tmp", `tts_${Date.now()}.mp3`);
+        const result = await openai.audio.speech.create({
+            model: "gpt-4o-mini-tts",
+            voice: "alloy", // 기본 여성에 가까운 중성 톤
+            input: text,
         });
-        const arrayBuf = await speech.arrayBuffer();
-        const buf = Buffer.from(arrayBuf);
-        const id = putMedia(buf, 'audio/mpeg');
-        const audioUrl = `${req.protocol}://${req.get('host')}/media/tts/${id}`;
-        return res.json({ audioUrl, provider: 'openai', voice: 'alloy' });
-    } catch (e) {
-        console.error('[TTS ERROR]', e);
-        return res.status(500).json({ error: 'server_error' });
+
+        const buffer = Buffer.from(await result.arrayBuffer());
+        fs.writeFileSync(speechFile, buffer);
+
+        const fileName = path.basename(speechFile);
+        res.json({ audioUrl: `/media/tts/${fileName}` });
+    } catch (err) {
+        console.error("tts error:", err);
+        res.status(500).json({ error: "tts_failed" });
     }
 });
 
-/* ------------------------------- STT 프록시 ------------------------------- */
-app.post(['/stt'], upload.single('file'), async (req, res) => {
+// STT
+app.post("/stt", upload.single("file"), async (req, res) => {
     try {
-        if (!req.file) return res.status(400).json({ error: 'no_file' });
-        const filename = req.file.originalname || 'recording.webm';
-        const mimetype = req.file.mimetype || 'audio/webm';
-        const form = new FormData();
-        form.append('model', 'whisper-1');
-        form.append('file', new File([req.file.buffer], filename, { type: mimetype }));
-
-        const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-            body: form,
+        const audioPath = req.file.path;
+        const transcript = await openai.audio.transcriptions.create({
+            model: "gpt-4o-mini-transcribe",
+            file: fs.createReadStream(audioPath),
         });
-        if (!r.ok) return res.status(r.status).send(await r.text());
-        const j = await r.json();
-        return res.json({ text: j.text || '' });
-    } catch (e) {
-        console.error('[STT ERROR]', e);
-        return res.status(500).json({ error: 'stt_failed' });
+        fs.unlinkSync(audioPath);
+        res.json({ text: transcript.text });
+    } catch (err) {
+        console.error("stt error:", err);
+        res.status(500).json({ error: "stt_failed" });
     }
 });
 
-/* ----------------------------- Serve TTS media ----------------------------- */
-app.get('/media/tts/:id', (req, res) => {
-    const item = getMedia(req.params.id);
-    if (!item) return res.status(404).send('Not found');
-    res.setHeader('Content-Type', item.mime || 'audio/mpeg');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-    return res.end(item.buf);
-});
+// mp3 서빙
+app.use("/media/tts", express.static(path.join(__dirname, "tmp")));
 
-/* --------------------------------- Listen --------------------------------- */
-app.listen(port, () => {
-    console.log(`Server on :${port}`);
-    console.log('Allowed origins:', allowedOrigins.join(', '));
+/* ---------------- 서버 실행 ---------------- */
+app.listen(PORT, () => {
+    console.log(`✅ Server running on port ${PORT}`);
 });
