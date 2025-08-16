@@ -23,7 +23,7 @@ const allowedOrigins =
 
 app.use(cors({
     origin(origin, cb) {
-        if (!origin) return cb(null, true); // health 등
+        if (!origin) return cb(null, true); // 헬스체크 등
         const ok = allowedOrigins.includes(origin);
         return ok ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`), false);
     },
@@ -46,11 +46,11 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 /* --------------------------------- Utils ---------------------------------- */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ✅ D‑ID 인증 헤더 (Basic: base64("<API_KEY>:"))
+// ✅ D-ID 인증 헤더 (Basic: base64("<API_KEY>:"))
 const didAuth =
     'Basic ' + Buffer.from(String(process.env.DID_API_KEY || '') + ':').toString('base64');
 
-/* ----------------------------- In‑Memory Media ----------------------------- */
+/* ----------------------------- In-Memory Media ----------------------------- */
 // 프로세스 리스타트 시 사라지는 간단 캐시
 const mediaStore = new Map(); // id -> { buf, mime, ts }
 const MEDIA_TTL_MS = Number(process.env.MEDIA_TTL_MS || 1000 * 60 * 60); // 1h
@@ -83,7 +83,7 @@ app.get(['/health', '/api/health'], (_req, res) =>
     res.json({
         ok: true,
         origins: allowedOrigins,
-        routes: ['/ask', '/api/ask', '/speak', '/api/speak', '/tts', '/media/tts/:id'],
+        routes: ['/ask', '/api/ask', '/speak', '/api/speak', '/tts', '/tts-eleven', '/media/tts/:id'],
     })
 );
 
@@ -112,7 +112,7 @@ app.post(['/ask', '/api/ask'], async (req, res) => {
 });
 
 /* ---------------------------------- SPEAK --------------------------------- */
-// 텍스트+이미지 → D‑ID 립싱크 영상 URL
+// 텍스트+이미지 → D-ID 립싱크 영상 URL
 app.post(['/speak', '/api/speak'], async (req, res) => {
     try {
         const { text, imageUrl, voice = 'en-US-JennyNeural' } = req.body || {};
@@ -200,8 +200,8 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
     }
 });
 
-/* ----------------------------------- TTS ---------------------------------- */
-// 텍스트 → 고음질 MP3 생성 후 미디어 URL 반환
+/* ----------------------------------- OpenAI TTS ---------------------------- */
+// 텍스트 → 고음질 MP3 생성 후 미디어 URL 반환 (백업 라인)
 app.post(['/tts', '/api/tts'], async (req, res) => {
     try {
         const { text, voice } = req.body || {};
@@ -216,7 +216,7 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
             model,
             voice: voiceId,
             input,
-            format, // 'mp3'
+            format,
         });
 
         const arrayBuf = await speech.arrayBuffer();
@@ -224,9 +224,43 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
         const id = putMedia(buf, 'audio/mpeg');
 
         const audioUrl = `${req.protocol}://${req.get('host')}/media/tts/${id}`;
-        return res.json({ audioUrl, model, voice: voiceId });
+        return res.json({ audioUrl, model, voice: voiceId, provider: 'openai' });
     } catch (e) {
         console.error('[TTS ERROR]', e);
+        return res.status(500).json({ error: 'server_error' });
+    }
+});
+
+/* --------------------------------- ElevenLabs TTS -------------------------- */
+// 모바일(iOS) 안정화를 위한 우선 경로
+app.post(['/tts-eleven', '/api/tts-eleven'], async (req, res) => {
+    try {
+        const { text, voice = 'Rachel' } = req.body || {};
+        const input = (text || '').toString().trim();
+        if (!input) return res.status(400).json({ error: 'text required' });
+        if (!process.env.ELEVEN_API_KEY) return res.status(500).json({ error: 'eleven_api_key_missing' });
+
+        const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice)}`, {
+            method: 'POST',
+            headers: {
+                'xi-api-key': process.env.ELEVEN_API_KEY,
+                'Content-Type': 'application/json',
+                'Accept': 'audio/mpeg',
+            },
+            body: JSON.stringify({ text: input }),
+        });
+
+        if (!r.ok) {
+            const t = await r.text();
+            return res.status(r.status).json({ error: 'eleven_failed', body: t.slice(0, 800) });
+        }
+
+        const buf = Buffer.from(await r.arrayBuffer());
+        const id = putMedia(buf, 'audio/mpeg');
+        const audioUrl = `${req.protocol}://${req.get('host')}/media/tts/${id}`;
+        return res.json({ audioUrl, provider: 'elevenlabs', voice });
+    } catch (e) {
+        console.error('[ELEVEN TTS ERROR]', e);
         return res.status(500).json({ error: 'server_error' });
     }
 });
@@ -260,7 +294,6 @@ app.get('/media/tts/:id', (req, res) => {
         return res.status(200).end(buf);
     }
 
-    // Parse Range: e.g. "bytes=0-"
     const m = /^bytes=(\d*)-(\d*)$/.exec(range);
     if (!m) {
         res.setHeader('Content-Length', String(total));
