@@ -114,9 +114,11 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
         if (!input) return res.status(400).json({ error: 'text_required' });
 
         // 여성 톤 지향: verse, 실패시 alloy
-        const model = process.env.TTS_MODEL || 'tts-1';
-        const voiceId = (voice || process.env.TTS_VOICE || 'verse'); // verse → 여성 느낌
-        const format = 'mp3';
+        const model = process.env.TTS_MODEL || 'gpt-4o-mini-tts'; // 최신 저비용 TTS 권장
+        const VOICES = ['nova', 'shimmer', 'echo', 'onyx', 'fable', 'alloy', 'ash', 'sage', 'coral'];
+        const requested = (voice || process.env.TTS_VOICE || 'sage').toLowerCase();
+        const voiceId = VOICES.includes(requested) ? requested : 'sage';
+        const format = 'mp3'; // mp3가 사파리/윈도우 모두 호환 잘 됨
 
         const speech = await openai.audio.speech.create({
             model,
