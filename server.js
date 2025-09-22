@@ -62,11 +62,6 @@ const didAuth = 'Basic ' + Buffer.from(String(process.env.DID_API_KEY || '') + '
 const AVATAR_URL = process.env.DEFAULT_AVATAR_IMAGE_URL; // D-ID 이미지 URL
 const DEFAULT_VOICE = process.env.DID_VOICE_ID || process.env.DID_TTS_VOICE || 'en-US-JennyNeural';
 
-/* ---------------------- In-memory video cache ---------------------- */
-const READY_Q = [];                           // { question, url }
-const MAX_Q = Number(process.env.PREFETCH_SIZE || 4);
-let prefetching = false;
-
 /* ----------------------------- Health ------------------------------ */
 app.get('/', (_req, res) => res.json({ service: 'OPIC Backend', ok: true }));
 app.get(['/health', '/api/health'], (_req, res) => res.json({
@@ -75,8 +70,6 @@ app.get(['/health', '/api/health'], (_req, res) => res.json({
     routes: [
         '/api/ask',
         '/api/speak',
-        '/api/queue/prefetch',
-        '/api/queue/next',
         '/api/did/webrtc/offer',
         '/api/did/webrtc/ice',
         '/api/did/webrtc/talk',
@@ -152,100 +145,6 @@ async function speakToVideoUrl(
     throw new Error('did_timeout');
 }
 
-/* ---------------------- 질문 20개 배치 프롬프트 ---------------------- */
-function buildBatchPrompt(profile) {
-    const { level = 'IH–AL', residence = '', role = '', recentCourse = '', topics = [] } = profile || {};
-    const topicLine = (Array.isArray(topics) && topics.length)
-        ? `Focus randomly on ONE of: ${topics.join(' | ')}`
-        : `Focus randomly on ONE everyday topic (home/routine/hobbies/work/school/travel etc.)`;
-    const profileLine = [
-        `Target level: ${level}`,
-        residence && `Residence: ${residence}`,
-        role && `Role: ${role}`,
-        recentCourse && `Recent course: ${recentCourse}`,
-    ].filter(Boolean).join(' | ');
-
-    return `
-You are an OPIC examiner.
-Generate 20 OPIC-style interview questions in English.
-- ${topicLine}
-- ${profileLine}
-- Each 14–22 words, single sentence.
-- Natural spoken style.
-- Return ONLY a JSON array of strings. No commentary.
-`.trim();
-}
-
-/* --------------------------- Prefetch APIs --------------------------- */
-// 백그라운드로 큐 채움
-app.post(['/api/queue/prefetch', '/queue/prefetch'], async (req, res) => {
-    try {
-        const want = Math.min(Number(req.body?.count || MAX_Q), MAX_Q);
-        const profile = req.body?.profile || {};
-        if (prefetching) return res.json({ ok: true, queued: READY_Q.length, prefetching: true });
-        prefetching = true;
-
-        (async () => {
-            try {
-                // (1) 질문 배치
-                const r = await openai.chat.completions.create({
-                    model: 'gpt-4o-mini',
-                    messages: [
-                        { role: 'system', content: 'You are an OPIC examiner.' },
-                        { role: 'user', content: buildBatchPrompt(profile) },
-                    ],
-                    temperature: 0.3,
-                });
-                const raw = (r.choices?.[0]?.message?.content || '')
-                    .replace(/^[\s\S]*?\[/, '[').replace(/\][\s\S]*?$/, ']');
-                let qs = [];
-                try { qs = JSON.parse(raw); } catch { qs = []; }
-                qs = (Array.isArray(qs) ? qs : []).filter(Boolean);
-
-                // (2) 중복 제거 후 최대 want개
-                const exist = new Set(READY_Q.map(x => x.question));
-                const pick = [];
-                for (const q of qs) {
-                    if (!exist.has(q)) pick.push(q);
-                    if (pick.length >= want) break;
-                }
-
-                // (3) 동시 2개로 렌더
-                const groups = pick.reduce((arr, q, i) => {
-                    (arr[Math.floor(i / 2)] ||= []).push(q); return arr;
-                }, []);
-                for (const g of groups) {
-                    await Promise.all(g.map(async (q) => {
-                        try {
-                            const url = await speakToVideoUrl(q, AVATAR_URL);
-                            READY_Q.push({ question: q, url });
-                            if (READY_Q.length > MAX_Q) READY_Q.shift();
-                        } catch (e) {
-                            console.warn('[prefetch render fail]', e.message);
-                        }
-                    }));
-                }
-            } catch (e) {
-                console.error('[prefetch error]', e?.response?.data || e.message);
-            } finally {
-                prefetching = false;
-            }
-        })();
-
-        res.json({ ok: true, queued: READY_Q.length });
-    } catch (e) {
-        console.error('[PREFETCH]', e);
-        res.status(500).json({ error: 'server_error' });
-    }
-});
-
-// 큐에서 즉시 꺼내오기
-app.get(['/api/queue/next', '/queue/next'], (_req, res) => {
-    const item = READY_Q.shift();
-    if (!item) return res.status(204).end();
-    res.json({ ok: true, ...item });
-});
-
 /* --------------------- 단건 생성(큐 비었을 때 폴백) --------------------- */
 app.post(['/speak', '/api/speak'], async (req, res) => {
     try {
@@ -264,44 +163,43 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
 });
 
 /* ===================== D-ID WebRTC proxy routes ===================== */
-/* 프론트(App.js)가 치는 /api/did/webrtc/* 엔드포인트 구현 (스트리밍 즉시 발화) */
 
-// 1) Offer: 프론트의 SDP(offer) → D-ID answer + session_id 반환
+// 1) Offer: 프론트의 SDP(offer) → D-ID answer + session_id 반환 (디버깅 추가)
 app.post(['/api/did/webrtc/offer', '/did/webrtc/offer'], async (req, res) => {
     try {
         const { sdp } = req.body || {};
         if (!sdp) return res.status(400).json({ error: 'missing_sdp' });
+
+        // console.log("✅ [SERVER] Avatar URL being sent to D-ID:", AVATAR_URL);
+        // console.log("✅ [SERVER] D-ID Auth Header being used:", didAuth ? didAuth.slice(0, 15) + "..." : "Auth Header is MISSING!");
+
         if (!process.env.DID_API_KEY) return res.status(500).json({ error: 'did_api_key_missing' });
 
-        // (a) 새 스트림 생성
-        const createRes = await fetch('https://api.d-id.com/talks/streams', {
+        const streamResponse = await fetch('https://api.d-id.com/talks/streams', {
             method: 'POST',
             headers: { Authorization: didAuth, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ source_url: AVATAR_URL }),
+            body: JSON.stringify({
+                source_url: AVATAR_URL,
+                sdp: sdp,
+            }),
             agent: pickAgent,
         });
-        const createTxt = await createRes.text();
-        if (!createRes.ok) {
-            return res.status(createRes.status).json({ error: 'did_create_stream_failed', body: createTxt.slice(0, 500) });
-        }
-        const { id } = JSON.parse(createTxt) || {};
-        if (!id) return res.status(502).json({ error: 'no_stream_id', body: createTxt.slice(0, 500) });
 
-        // (b) SDP 교환(offer -> answer)
-        const sdpRes = await fetch(`https://api.d-id.com/talks/streams/${id}/sdp`, {
-            method: 'POST',
-            headers: { Authorization: didAuth, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sdp }),
-            agent: pickAgent,
-        });
-        const sdpTxt = await sdpRes.text();
-        if (!sdpRes.ok) {
-            return res.status(sdpRes.status).json({ error: 'did_sdp_failed', body: sdpTxt.slice(0, 500) });
+        const streamText = await streamResponse.text();
+        if (!streamResponse.ok) {
+            return res.status(streamResponse.status).json({ error: 'did_create_stream_failed', body: streamText.slice(0, 500) });
         }
-        const { answer } = JSON.parse(sdpTxt) || {};
-        if (!answer) return res.status(502).json({ error: 'no_answer', body: sdpTxt.slice(0, 500) });
 
-        return res.json({ answer, session_id: id, imageUrl: AVATAR_URL, voice: DEFAULT_VOICE });
+        const streamData = JSON.parse(streamText);
+        const sessionId = streamData.id;
+        const sdpAnswer = streamData.sdp;
+
+        if (!sessionId || !sdpAnswer) {
+            return res.status(502).json({ error: 'did_response_missing_info', body: streamText.slice(0, 500) });
+        }
+
+        return res.json({ answer: sdpAnswer, session_id: sessionId });
+
     } catch (err) {
         console.error('[DID/OFFER]', err);
         res.status(500).json({ error: 'server_error' });
