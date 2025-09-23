@@ -164,15 +164,11 @@ app.post(['/speak', '/api/speak'], async (req, res) => {
 
 /* ===================== D-ID WebRTC proxy routes ===================== */
 
-// 1) Offer: 프론트의 SDP(offer) → D-ID answer + session_id 반환 (디버깅 추가)
+// 1) Offer: 프론트의 SDP(offer) → D-ID answer + session_id 반환 (최종 수정본)
 app.post(['/api/did/webrtc/offer', '/did/webrtc/offer'], async (req, res) => {
     try {
         const { sdp } = req.body || {};
         if (!sdp) return res.status(400).json({ error: 'missing_sdp' });
-
-        // console.log("✅ [SERVER] Avatar URL being sent to D-ID:", AVATAR_URL);
-        // console.log("✅ [SERVER] D-ID Auth Header being used:", didAuth ? didAuth.slice(0, 15) + "..." : "Auth Header is MISSING!");
-
         if (!process.env.DID_API_KEY) return res.status(500).json({ error: 'did_api_key_missing' });
 
         const streamResponse = await fetch('https://api.d-id.com/talks/streams', {
@@ -192,7 +188,7 @@ app.post(['/api/did/webrtc/offer', '/did/webrtc/offer'], async (req, res) => {
 
         const streamData = JSON.parse(streamText);
         const sessionId = streamData.id;
-        const sdpAnswer = streamData.sdp;
+        const sdpAnswer = streamData.offer.sdp; // ✅ 수정된 부분
 
         if (!sessionId || !sdpAnswer) {
             return res.status(502).json({ error: 'did_response_missing_info', body: streamText.slice(0, 500) });
