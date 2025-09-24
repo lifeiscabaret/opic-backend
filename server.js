@@ -4,15 +4,20 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import { OpenAI } from 'openai';
-import http from 'http';
-import https from 'https';
+import crypto from 'node:crypto';
+import { Agent as UndiciAgent, setGlobalDispatcher } from 'undici';
+import { toFile } from 'openai/uploads';
+
 
 const app = express();
 const port = process.env.PORT || 8080;
 
-/* ---------------- Keep-Alive agents (왕복 지연 ↓) ---------------- */
-const httpAgent = new http.Agent({ keepAlive: true });
-const httpsAgent = new https.Agent({ keepAlive: true });
+/* ---------------- Keep-Alive (undici 전역 디스패처) ---------------- */
+setGlobalDispatcher(new UndiciAgent({
+    keepAliveTimeout: 10_000,
+    keepAliveMaxTimeout: 10_000,
+    connections: 128,
+}));
 
 /* ------------------------------- CORS -------------------------------- */
 const DEFAULT_ORIGINS = [
@@ -37,13 +42,13 @@ app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: false }));
 
-// ✅ 파일 업로드를 처리하기 위한 multer 설정
+// 파일 업로드 (Whisper 전송용)
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 25 * 1024 * 1024 }, // 25MB 파일 크기 제한
+    limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
 });
 
-/* ----------------------------- Clients ----------------------------- */
+/* ----------------------------- OpenAI Client ----------------------------- */
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /* ----------------------------- Health ------------------------------ */
@@ -51,11 +56,7 @@ app.get('/', (_req, res) => res.json({ service: 'OPIC Backend', ok: true }));
 app.get(['/health', '/api/health'], (_req, res) => res.json({
     ok: true,
     origins: allowedOrigins,
-    routes: [
-        '/api/ask',
-        '/api/tts',
-        '/api/transcribe', // ✅ 새로운 음성인식 엔드포인트
-    ],
+    routes: ['/api/ask', '/api/tts', '/api/transcribe'],
 }));
 
 /* ------------------------------- ASK (GPT 답변) ------------------------------- */
@@ -71,7 +72,7 @@ app.post(['/ask', '/api/ask'], async (req, res) => {
                 { role: 'system', content: 'You are an OPIC examiner.' },
                 { role: 'user', content }
             ],
-            temperature: 0.5,
+            temperature: 0.7,
         });
         const answer = r.choices?.[0]?.message?.content ?? '';
         res.json({ answer });
@@ -81,56 +82,104 @@ app.post(['/ask', '/api/ask'], async (req, res) => {
     }
 });
 
+/* ------------------------- TTS (OpenAI 음성 생성 + LRU 캐시) ------------------------- */
+const TTS_CACHE_LIMIT = Number(process.env.TTS_CACHE_LIMIT || 100);
+const ttsCache = new Map(); // key -> Buffer
+const ttsKey = (text, voice) =>
+    crypto.createHash('md5').update(`${voice}|${text}`).digest('hex');
 
-/* ---------------------------- TTS (OpenAI 음성 생성) -------------------------------- */
+// OpenAI TTS 지원 보이스(여성 기본: shimmer)
+const ALLOWED_VOICES = new Set([
+    'nova', 'shimmer', 'echo', 'onyx', 'fable', 'alloy', 'ash', 'sage', 'coral'
+]);
+
 app.post(['/tts', '/api/tts'], async (req, res) => {
     try {
-        const { text, voice = 'alloy' } = req.body || {};
+        const { text, voice } = req.body || {};
         if (!text) return res.status(400).json({ error: 'text required' });
 
-        const audioStream = await openai.audio.speech.create({
-            model: 'tts-1',
-            voice: voice,
-            input: text,
-            response_format: 'mp3',
-        });
+        // 기본 여성 음성
+        const wanted = String(voice || 'shimmer').toLowerCase();
+        const safeVoice = ALLOWED_VOICES.has(wanted) ? wanted : 'shimmer';
+
+        // LRU 캐시 조회
+        const key = ttsKey(text, safeVoice);
+        const hit = ttsCache.get(key);
+        if (hit) {
+            res.setHeader('Content-Type', 'audio/mpeg');
+            res.setHeader('Content-Length', String(hit.length));
+            res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+            return res.end(hit);
+        }
+
+        // OpenAI TTS 호출 (safeVoice로 시도, 실패 시 alloy로 폴백)
+        let stream;
+        try {
+            stream = await openai.audio.speech.create({
+                model: 'tts-1',
+                voice: safeVoice,
+                input: text,
+                response_format: 'mp3',
+            });
+        } catch (err) {
+            if (safeVoice !== 'alloy') {
+                stream = await openai.audio.speech.create({
+                    model: 'tts-1',
+                    voice: 'alloy',
+                    input: text,
+                    response_format: 'mp3',
+                });
+            } else {
+                throw err;
+            }
+        }
+
+        // 스트림 -> 버퍼
+        const chunks = [];
+        for await (const chunk of stream.body) chunks.push(chunk);
+        const buf = Buffer.concat(chunks);
+
+        // LRU 저장
+        ttsCache.set(key, buf);
+        if (ttsCache.size > TTS_CACHE_LIMIT) {
+            const oldestKey = ttsCache.keys().next().value;
+            ttsCache.delete(oldestKey);
+        }
 
         res.setHeader('Content-Type', 'audio/mpeg');
-        audioStream.body.pipe(res);
-
+        res.setHeader('Content-Length', String(buf.length));
+        res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+        res.end(buf);
     } catch (e) {
         console.error('[TTS]', e?.response?.data || e.message);
         res.status(500).json({ error: 'tts_server_error' });
     }
 });
 
-
 /* ------------------------- TRANSCRIBE (Whisper 음성인식) -------------------------- */
-// ✅ 여기가 사용자의 녹음 파일을 텍스트로 변환하는 새로운 핵심 기능입니다.
 app.post(['/transcribe', '/api/transcribe'], upload.single('audio'), async (req, res) => {
     try {
-        if (!req.file) {
-            return res.status(400).json({ error: 'No audio file uploaded.' });
-        }
+        if (!req.file) return res.status(400).json({ error: 'No audio file uploaded.' });
 
-        // Whisper API는 파일 이름과 타입 정보가 필요합니다.
-        // req.file.buffer를 가상의 파일처럼 만들어 전달합니다.
-        const audioFile = {
-            name: req.file.originalname || 'audio.webm',
-            type: req.file.mimetype,
-        };
+        const mime = req.file.mimetype || 'audio/webm';
+        const ext =
+            (req.file.originalname && req.file.originalname.split('.').pop()) ||
+            (mime.includes('/') ? mime.split('/')[1] : 'webm');
+
+        // ✅ Buffer -> File (권장)
+        const file = await toFile(req.file.buffer, `recording.${ext}`, { contentType: mime });
 
         const transcription = await openai.audio.transcriptions.create({
             model: 'whisper-1',
-            file: new File([req.file.buffer], audioFile.name, { type: audioFile.type }),
-            language: 'en', // 영어(en)로 인식하도록 설정
+            file,           // File 객체
+            language: 'en', // 필요하면 'ko' 등으로 변경
         });
 
-        res.json({ text: transcription.text });
-
+        res.json({ text: transcription.text || "" });
     } catch (e) {
-        console.error('[TRANSCRIBE]', e?.response?.data || e.message);
-        res.status(500).json({ error: 'transcribe_server_error' });
+        const detail = e?.response?.data || e?.message || e;
+        console.error('[TRANSCRIBE]', detail);
+        res.status(500).json({ error: 'transcribe_server_error', detail });
     }
 });
 
@@ -143,8 +192,32 @@ app.use((err, _req, res, _next) => {
     res.status(500).json({ error: 'server_error' });
 });
 
-/* ------------------------------- Listen ------------------------------- */
-app.listen(port, () => {
+/* ------------------------------- Listen + Warm-up ------------------------------- */
+app.listen(port, async () => {
     console.log(`Server on :${port}`);
     console.log('Allowed origins:', allowedOrigins.join(', '));
+
+    // 서버 기동 직후 Warm-up (첫 요청 레이턴시↓)
+    (async function warmUp() {
+        try {
+            console.log('[Warmup] start');
+            // 1) Chat warm-up
+            await openai.chat.completions.create({
+                model: 'gpt-4o-mini',
+                messages: [{ role: 'user', content: 'ping' }],
+                temperature: 0.1,
+            });
+            // 2) TTS warm-up (지원 보이스)
+            const r = await openai.audio.speech.create({
+                model: 'tts-1',
+                voice: 'shimmer', // 여성 기본
+                input: 'ready',
+                response_format: 'mp3',
+            });
+            await r.body?.cancel?.().catch(() => { });
+            console.log('[Warmup] done');
+        } catch (e) {
+            console.log('[Warmup] skipped:', e?.message || e);
+        }
+    })();
 });
