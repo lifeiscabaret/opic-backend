@@ -8,7 +8,6 @@ import crypto from 'node:crypto';
 import { Agent as UndiciAgent, setGlobalDispatcher } from 'undici';
 import { toFile } from 'openai/uploads';
 
-
 const app = express();
 const port = process.env.PORT || 8080;
 
@@ -48,8 +47,15 @@ const upload = multer({
     limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
 });
 
-/* ----------------------------- OpenAI Client ----------------------------- */
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+/* ----------------------------- OpenAI Client (lazy) ----------------------------- */
+let openai = null;
+function getOpenAI() {
+    if (openai) return openai;
+    const key = process.env.OPENAI_API_KEY;
+    if (!key) return null;
+    openai = new OpenAI({ apiKey: key });
+    return openai;
+}
 
 /* ----------------------------- Health ------------------------------ */
 app.get('/', (_req, res) => res.json({ service: 'OPIC Backend', ok: true }));
@@ -66,7 +72,10 @@ app.post(['/ask', '/api/ask'], async (req, res) => {
         const content = (prompt ?? question)?.toString().trim();
         if (!content) return res.status(400).json({ error: 'question required' });
 
-        const r = await openai.chat.completions.create({
+        const client = getOpenAI();
+        if (!client) return res.status(500).json({ error: 'OPENAI_API_KEY missing' });
+
+        const r = await client.chat.completions.create({
             model: 'gpt-4o-mini',
             messages: [
                 { role: 'system', content: 'You are an OPIC examiner.' },
@@ -88,7 +97,6 @@ const ttsCache = new Map(); // key -> Buffer
 const ttsKey = (text, voice) =>
     crypto.createHash('md5').update(`${voice}|${text}`).digest('hex');
 
-// OpenAI TTS 지원 보이스(여성 기본: shimmer)
 const ALLOWED_VOICES = new Set([
     'nova', 'shimmer', 'echo', 'onyx', 'fable', 'alloy', 'ash', 'sage', 'coral'
 ]);
@@ -98,11 +106,12 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
         const { text, voice } = req.body || {};
         if (!text) return res.status(400).json({ error: 'text required' });
 
-        // 기본 여성 음성
+        const client = getOpenAI();
+        if (!client) return res.status(500).json({ error: 'OPENAI_API_KEY missing' });
+
         const wanted = String(voice || 'shimmer').toLowerCase();
         const safeVoice = ALLOWED_VOICES.has(wanted) ? wanted : 'shimmer';
 
-        // LRU 캐시 조회
         const key = ttsKey(text, safeVoice);
         const hit = ttsCache.get(key);
         if (hit) {
@@ -112,10 +121,9 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
             return res.end(hit);
         }
 
-        // OpenAI TTS 호출 (safeVoice로 시도, 실패 시 alloy로 폴백)
         let stream;
         try {
-            stream = await openai.audio.speech.create({
+            stream = await client.audio.speech.create({
                 model: 'tts-1',
                 voice: safeVoice,
                 input: text,
@@ -123,7 +131,7 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
             });
         } catch (err) {
             if (safeVoice !== 'alloy') {
-                stream = await openai.audio.speech.create({
+                stream = await client.audio.speech.create({
                     model: 'tts-1',
                     voice: 'alloy',
                     input: text,
@@ -134,12 +142,10 @@ app.post(['/tts', '/api/tts'], async (req, res) => {
             }
         }
 
-        // 스트림 -> 버퍼
         const chunks = [];
         for await (const chunk of stream.body) chunks.push(chunk);
         const buf = Buffer.concat(chunks);
 
-        // LRU 저장
         ttsCache.set(key, buf);
         if (ttsCache.size > TTS_CACHE_LIMIT) {
             const oldestKey = ttsCache.keys().next().value;
@@ -166,13 +172,15 @@ app.post(['/transcribe', '/api/transcribe'], upload.single('audio'), async (req,
             (req.file.originalname && req.file.originalname.split('.').pop()) ||
             (mime.includes('/') ? mime.split('/')[1] : 'webm');
 
-        // ✅ Buffer -> File (권장)
         const file = await toFile(req.file.buffer, `recording.${ext}`, { contentType: mime });
 
-        const transcription = await openai.audio.transcriptions.create({
+        const client = getOpenAI();
+        if (!client) return res.status(500).json({ error: 'OPENAI_API_KEY missing' });
+
+        const transcription = await client.audio.transcriptions.create({
             model: 'whisper-1',
-            file,           // File 객체
-            language: 'en', // 필요하면 'ko' 등으로 변경
+            file,
+            language: 'en',
         });
 
         res.json({ text: transcription.text || "" });
@@ -183,34 +191,34 @@ app.post(['/transcribe', '/api/transcribe'], upload.single('audio'), async (req,
     }
 });
 
-
 /* ----------------------------- 404 & Error ----------------------------- */
 app.use((req, res) => res.status(404).json({ error: 'not_found', path: req.path }));
-// eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {
     console.error('[UNCAUGHT]', err);
     res.status(500).json({ error: 'server_error' });
 });
 
 /* ------------------------------- Listen + Warm-up ------------------------------- */
-app.listen(port, async () => {
+app.listen(port, '0.0.0.0', async () => {
     console.log(`Server on :${port}`);
     console.log('Allowed origins:', allowedOrigins.join(', '));
 
-    // 서버 기동 직후 Warm-up (첫 요청 레이턴시↓)
     (async function warmUp() {
         try {
+            const client = getOpenAI();
+            if (!client) {
+                console.log('[Warmup] skipped: no key');
+                return;
+            }
             console.log('[Warmup] start');
-            // 1) Chat warm-up
-            await openai.chat.completions.create({
+            await client.chat.completions.create({
                 model: 'gpt-4o-mini',
                 messages: [{ role: 'user', content: 'ping' }],
                 temperature: 0.1,
             });
-            // 2) TTS warm-up (지원 보이스)
-            const r = await openai.audio.speech.create({
+            const r = await client.audio.speech.create({
                 model: 'tts-1',
-                voice: 'shimmer', // 여성 기본
+                voice: 'shimmer',
                 input: 'ready',
                 response_format: 'mp3',
             });
