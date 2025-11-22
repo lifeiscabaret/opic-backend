@@ -74,6 +74,7 @@ app.get(['/health', '/api/health'], (_req, res) => {
         origins: allowedOrigins,
         routes: [
             '/ask', '/api/ask',
+            '/review', '/api/review',
             '/tts', '/api/tts',
             '/stt', '/api/stt',
             '/media/tts/:id'
@@ -101,6 +102,122 @@ app.post(['/ask', '/api/ask'], async (req, res) => {
         return res.json({ answer });
     } catch (e) {
         console.error('[ASK ERROR]', e);
+        return res.status(500).json({ error: 'server_error' });
+    }
+});
+
+/* ----------------------------- OPIc Review Prompt ----------------------------- */
+function buildReviewPrompt({ questionText, answerText, targetLevel }) {
+    return `
+You are a professional OPIc speaking test evaluator.
+
+Your task:
+- Evaluate the user's spoken answer (already transcribed into text).
+- Target OPIc level: ${targetLevel} (e.g., IM1, IM2, IH, AL)
+- Question: """${questionText}"""
+- User answer: """${answerText}"""
+
+Evaluation criteria:
+1. Fluency (natural flow, pauses, hesitation)
+2. Grammar (accuracy, range)
+3. Vocabulary (range, appropriateness, topic relevance)
+4. Task Achievement (did they fully and clearly answer the question?)
+
+Output format:
+You MUST return ONLY a single JSON object, with NO extra text.
+
+The JSON structure MUST be:
+
+{
+  "fluency": "1~2 sentence feedback",
+  "grammar": "1~2 sentence feedback",
+  "vocab": "1~2 sentence feedback",
+  "taskAchievement": "1~3 sentence feedback",
+  "score": 1-5,
+  "overallFeedback": "3~5 sentence overall feedback",
+  "recommendedLevel": "IM1" | "IM2" | "IH" | "AL"
+}
+
+Constraints:
+- "score" must be an integer between 1 and 5.
+- "recommendedLevel" must be exactly one of "IM1", "IM2", "IH", "AL".
+- Do NOT include any explanation outside the JSON.
+`;
+}
+
+/* ------------------------------- REVIEW (OPIc Answer Evaluation) ------------------------------- */
+app.post(['/review', '/api/review'], async (req, res) => {
+    try {
+        const {
+            questionId,
+            questionText,
+            answerText,
+            targetLevel, // "IM1" | "IM2" | "IH" | "AL"
+        } = req.body || {};
+
+        if (!questionId || !questionText || !answerText || !targetLevel) {
+            return res.status(400).json({
+                error: 'missing_fields',
+                message: 'questionId, questionText, answerText, targetLevel는 모두 필수입니다.',
+            });
+        }
+
+        const prompt = buildReviewPrompt({
+            questionText: questionText.toString(),
+            answerText: answerText.toString(),
+            targetLevel: targetLevel.toString(),
+        });
+
+        const completion = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+                {
+                    role: 'system',
+                    content: 'You are a strict but kind OPIc speaking test evaluator.',
+                },
+                {
+                    role: 'user',
+                    content: prompt,
+                },
+            ],
+            temperature: 0.3,
+            response_format: { type: 'json_object' }, // JSON 강제
+        });
+
+        let rawContent = completion.choices?.[0]?.message?.content?.trim() || '';
+
+        // 혹시라도 ```json ... ``` 형태로 올 경우 대비한 방어 로직
+        if (rawContent.startsWith('```')) {
+            rawContent = rawContent
+                .replace(/^```json/i, '')
+                .replace(/^```/, '')
+                .replace(/```$/, '')
+                .trim();
+        }
+
+        let review;
+        try {
+            review = JSON.parse(rawContent);
+        } catch (e) {
+            console.error('[REVIEW JSON PARSE ERROR] rawContent =', rawContent);
+            return res.status(500).json({
+                error: 'invalid_review_json',
+                rawContent,
+            });
+        }
+
+        // 최소 검증 (score / overallFeedback 정도)
+        if (typeof review.score !== 'number' || !review.overallFeedback) {
+            console.warn('[REVIEW SHAPE WARNING] review =', review);
+        }
+
+        return res.json({
+            questionId,
+            targetLevel,
+            ...review,
+        });
+    } catch (e) {
+        console.error('[REVIEW ERROR]', e);
         return res.status(500).json({ error: 'server_error' });
     }
 });
