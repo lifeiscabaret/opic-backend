@@ -11,6 +11,13 @@ import fetch from 'node-fetch';
 import http from 'http';
 import https from 'https';
 
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
 const port = process.env.PORT || 8080;
 
@@ -97,6 +104,7 @@ app.get(['/health', '/api/health'], (_req, res) => {
             '/tts', '/api/tts',
             '/stt', '/api/stt',
             '/media/tts/:id',
+            '/video/:id', '/api/video/:id',
             '/api/test-did' // 테스트 라우트
         ],
     });
@@ -128,41 +136,41 @@ app.post(['/ask', '/api/ask'], async (req, res) => {
 /* ----------------------------- OPIc Review Prompt ----------------------------- */
 function buildReviewPrompt({ questionText, answerText, targetLevel }) {
     return `
-You are a professional OPIc speaking test evaluator.
+당신은 OPIC 전문 평가관이자 영어 스피킹 코치입니다.  
+아래 사용자의 영어 답변을 분석하여 **모든 피드백을 한국어로** 제공해주세요.
 
-Your task:
-- Evaluate the user's spoken answer (already transcribed into text).
-- Target OPIc level: ${targetLevel} (e.g., IM1, IM2, IH, AL)
-- Question: """${questionText}"""
-- User answer: """${answerText}"""
+평가 기준:
+1. 유창성(Fluency): 말의 자연스러움, 망설임, 흐름
+2. 문법(Grammar): 문법의 정확성, 문장 구조
+3. 어휘(Vocabulary): 어휘 범위, 적절성, 주제 관련성
+4. 내용 충실도(Task Achievement): 질문에 얼마나 명확하고 충분하게 답했는지
 
-Evaluation criteria:
-1. Fluency (natural flow, pauses, hesitation)
-2. Grammar (accuracy, range)
-3. Vocabulary (range, appropriateness, topic relevance)
-4. Task Achievement (did they fully and clearly answer the question?)
+출력 형식:
+반드시 **JSON 객체만 반환**해야 하며, JSON 외의 설명은 절대로 포함하지 마세요.
 
-Output format:
-You MUST return ONLY a single JSON object, with NO extra text.
-
-The JSON structure MUST be:
+JSON 구조:
 
 {
-  "fluency": "1~2 sentence feedback",
-  "grammar": "1~2 sentence feedback",
-  "vocab": "1~2 sentence feedback",
-  "taskAchievement": "1~3 sentence feedback",
+  "fluency": "1~2문장 한국어 피드백",
+  "grammar": "1~2문장 한국어 피드백",
+  "vocab": "1~2문장 한국어 피드백",
+  "taskAchievement": "1~3문장 한국어 피드백",
   "score": 1-5,
-  "overallFeedback": "3~5 sentence overall feedback",
+  "overallFeedback": "3~5문장 한국어 총평",
   "recommendedLevel": "IM1" | "IM2" | "IH" | "AL"
 }
 
-Constraints:
-- "score" must be an integer between 1 and 5.
-- "recommendedLevel" must be exactly one of "IM1", "IM2", "IH", "AL".
-- Do NOT include any explanation outside the JSON.
-`;
+주의:
+- "score"는 반드시 1~5 사이의 정수여야 합니다.
+- "recommendedLevel"은 반드시 "IM1", "IM2", "IH", "AL" 중 하나로 선택하세요.
+- JSON 외의 텍스트(서론, 결론, 설명 등)는 절대 포함하지 마세요.
+
+질문: """${questionText}"""
+사용자 답변: """${answerText}"""
+목표 레벨: ${targetLevel}
+    `;
 }
+
 
 /* ------------------------------- REVIEW (OPIc Answer Evaluation) ------------------------------- */
 app.post(['/review', '/api/review'], async (req, res) => {
@@ -337,6 +345,19 @@ app.get('/media/tts/:id', (req, res) => {
     res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
     res.setHeader('Content-Length', String(chunk.length));
     return res.end(chunk);
+});
+
+/* ----------------------------- Serve avatar videos ----------------------------- */
+app.get(['/video/:id', '/api/video/:id'], (req, res) => {
+    const { id } = req.params;
+    const filePath = path.join(__dirname, 'videos', `${id}.mp4`);
+
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'video_not_found', id });
+    }
+
+    // 단순 파일 서빙 (스트리밍 최적화 필요하면 나중에 range 처리 추가 가능)
+    return res.sendFile(filePath);
 });
 
 // ====================================================================
